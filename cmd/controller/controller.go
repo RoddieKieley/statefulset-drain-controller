@@ -25,7 +25,7 @@ import (
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/clientcmd"
 	"github.com/luksa/statefulset-drain-controller/pkg/signals"
-	"github.com/luksa/statefulset-drain-controller/pkg/controller"
+	"github.com/roddiekieley/statefulset-drain-controller/pkg/controller"
 	"io/ioutil"
 )
 
@@ -69,7 +69,7 @@ func main() {
 		kubeInformerFactory = kubeinformers.NewSharedInformerFactory(kubeClient, time.Second*30)
 	}
 
-	drainController := controller.NewController(kubeClient, kubeInformerFactory)
+	drainController := controller.NewController(kubeClient, kubeInformerFactory, namespace, localOnly)
 
 	go kubeInformerFactory.Start(stopCh)
 

@@ -82,12 +82,16 @@ type Controller struct {
 	// recorder is an event recorder for recording Event resources to the
 	// Kubernetes API.
 	recorder record.EventRecorder
+
+	localOnly		   bool
 }
 
 // NewController returns a new sample controller
 func NewController(
 	kubeclientset kubernetes.Interface,
-	kubeInformerFactory kubeinformers.SharedInformerFactory) *Controller {
+	kubeInformerFactory kubeinformers.SharedInformerFactory,
+	namespace string,
+	localOnly bool) *Controller {
 
 	// obtain references to shared index informers for the Deployment and Foo
 	// types.
@@ -101,8 +105,9 @@ func NewController(
 	glog.V(4).Info("Creating event broadcaster")
 	eventBroadcaster := record.NewBroadcaster()
 	eventBroadcaster.StartLogging(glog.Infof)
-	eventBroadcaster.StartRecordingToSink(&typedcorev1.EventSinkImpl{Interface: kubeclientset.CoreV1().Events("")})
+	eventBroadcaster.StartRecordingToSink(&typedcorev1.EventSinkImpl{Interface: kubeclientset.CoreV1().Events(namespace)})
 	recorder := eventBroadcaster.NewRecorder(scheme.Scheme, corev1.EventSource{Component: controllerAgentName})
+	itemExponentialFailureRateLimiter := workqueue.NewItemExponentialFailureRateLimiter(5*time.Second, 300*time.Second)
 
 	controller := &Controller{
 		kubeclientset:      kubeclientset,
@@ -112,8 +117,9 @@ func NewController(
 		pvcsSynched:        pvcInformer.Informer().HasSynced,
 		podLister:          podInformer.Lister(),
 		podsSynced:         podInformer.Informer().HasSynced,
-		workqueue:          workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "StatefulSets"),
+		workqueue:          workqueue.NewNamedRateLimitingQueue(itemExponentialFailureRateLimiter, "StatefulSets"),
 		recorder:           recorder,
+		localOnly:          localOnly,
 	}
 
 	glog.Info("Setting up event handlers")
@@ -307,6 +313,24 @@ func (c *Controller) processStatefulSet(sts *appsv1.StatefulSet) error {
 			return err
 		}
 
+		// Is it a drain pod or a regular stateful pod?
+		if isDrainPod(pod) {
+			err = c.cleanUpDrainPodIfNeeded(sts, pod, ordinal)
+			if err != nil {
+				return err
+			}
+
+			if sts.Spec.PodManagementPolicy == appsv1.OrderedReadyPodManagement {
+				// don't create additional drain pods; they will be created in one of the
+				// next invocations of this method, when the current drain pod finishes
+				break
+			}
+		} else {
+			// DO nothing. Pod is a regular stateful pod
+			//glog.Infof("Pod '%s' exists. Not taking any action.", podName)
+			//return nil
+		}
+
 		// TODO: scale down to zero? should what happens on such events be configurable? there may or may not be anywhere to drain to
 		if int32(ordinal) >= *sts.Spec.Replicas {
 			// PVC exists, but its ordinal is higher than the current last stateful pod's ordinal;
@@ -330,31 +354,14 @@ func (c *Controller) processStatefulSet(sts *appsv1.StatefulSet) error {
 					return err
 				}
 
-				c.recorder.Event(sts, corev1.EventTypeNormal, SuccessCreate, fmt.Sprintf(MessageDrainPodCreated, podName, sts.Name))
+                if (!c.localOnly) {
+					c.recorder.Event(sts, corev1.EventTypeNormal, SuccessCreate, fmt.Sprintf(MessageDrainPodCreated, podName, sts.Name))
+				}
 
 				continue
 				//} else {
 				//	glog.Infof("Pod '%s' exists. Not taking any action.", podName)
-
 			}
-		}
-
-		// Is it a drain pod or a regular stateful pod?
-		if isDrainPod(pod) {
-			err = c.cleanUpDrainPodIfNeeded(sts, pod, ordinal)
-			if err != nil {
-				return err
-			}
-
-			if sts.Spec.PodManagementPolicy == appsv1.OrderedReadyPodManagement {
-				// don't create additional drain pods; they will be created in one of the
-				// next invocations of this method, when the current drain pod finishes
-				break
-			}
-		} else {
-			// DO nothing. Pod is a regular stateful pod
-			//glog.Infof("Pod '%s' exists. Not taking any action.", podName)
-			//return nil
 		}
 	}
 
@@ -401,7 +408,9 @@ func (c *Controller) cleanUpDrainPodIfNeeded(sts *appsv1.StatefulSet, pod *corev
 		podName := getPodName(sts, ordinal)
 
 		glog.Infof("Drain pod '%s' finished.", podName)
-		c.recorder.Event(sts, corev1.EventTypeNormal, DrainSuccess, fmt.Sprintf(MessageDrainPodFinished, podName, sts.Name))
+		if (!c.localOnly) {
+			c.recorder.Event(sts, corev1.EventTypeNormal, DrainSuccess, fmt.Sprintf(MessageDrainPodFinished, podName, sts.Name))
+		}
 
 		for _, pvcTemplate := range sts.Spec.VolumeClaimTemplates {
 			pvcName := getPVCName(sts, pvcTemplate.Name, int32(ordinal))
@@ -410,7 +419,9 @@ func (c *Controller) cleanUpDrainPodIfNeeded(sts *appsv1.StatefulSet, pod *corev
 			if err != nil {
 				return err
 			}
-			c.recorder.Event(sts, corev1.EventTypeNormal, PVCDeleteSuccess, fmt.Sprintf(MessagePVCDeleted, pvcName, sts.Name))
+			if (!c.localOnly) {
+				c.recorder.Event(sts, corev1.EventTypeNormal, PVCDeleteSuccess, fmt.Sprintf(MessagePVCDeleted, pvcName, sts.Name))
+			}
 		}
 
 		// TODO what if the user scales up the statefulset and the statefulset controller creates the new pod after we delete the pod but before we delete the PVC
@@ -421,7 +432,9 @@ func (c *Controller) cleanUpDrainPodIfNeeded(sts *appsv1.StatefulSet, pod *corev
 		if err != nil {
 			return err
 		}
-		c.recorder.Event(sts, corev1.EventTypeNormal, PodDeleteSuccess, fmt.Sprintf(MessageDrainPodDeleted, podName, sts.Name))
+		if (!c.localOnly) {
+			c.recorder.Event(sts, corev1.EventTypeNormal, PodDeleteSuccess, fmt.Sprintf(MessageDrainPodDeleted, podName, sts.Name))
+		}
 	}
 	return nil
 }
