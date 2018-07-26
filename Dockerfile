@@ -1,4 +1,4 @@
 FROM busybox
 ADD controller /controller
 
-ENTRYPOINT ["/controller", "--alsologtostderr", "--v", "3"]
+ENTRYPOINT ["/controller", "--alsologtostderr"]
