@@ -304,6 +304,18 @@ func (c *Controller) processStatefulSet(sts *appsv1.StatefulSet) error {
 
 	for _, ordinal := range ordinals {
 
+        if (0 == *sts.Spec.Replicas) {
+			// Ensure data is not touched in the case of complete scaledown
+            glog.V(5).Infof("Replicas set to 0 for statefulset %s, ignoring.", sts.Name)
+			continue
+		}
+
+        if (0 == ordinal) {
+			// This assumes order on scale up and down is enforced, i.e. the system waits for n, n-1,... 2, 1 to scaledown before attempting 0
+			glog.V(5).Infof("Ignoring ordinal 0 as no other pod to drain to.")
+			continue
+		}
+
 		// TODO check if the number of claims matches the number of StatefulSet's volumeClaimTemplates. What if it doesn't?
 
 		podName := getPodName(sts, ordinal)
