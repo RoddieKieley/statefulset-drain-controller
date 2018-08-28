@@ -278,11 +278,19 @@ func (c *Controller) syncHandler(key string) error {
 func (c *Controller) processStatefulSet(sts *appsv1.StatefulSet) error {
 	// TODO: think about scale-down during a rolling upgrade
 
+	if (0 == *sts.Spec.Replicas) {
+		// Ensure data is not touched in the case of complete scaledown
+		glog.V(5).Infof("Ignoring StatefulSet '%s' because replicas set to 0.", sts.Name)
+		return nil
+	}
+	glog.V(5).Infof("Statefulset '%s' Spec.Replicas set to %d.", sts.Name, *sts.Spec.Replicas)
+
 	if len(sts.Spec.VolumeClaimTemplates) == 0 {
 		// nothing to do, as the stateful pods don't use any PVCs
 		glog.Infof("Ignoring StatefulSet '%s' because it does not use any PersistentVolumeClaims.", sts.Name)
 		return nil
 	}
+	glog.V(5).Infof("Statefulset '%s' Spec.VolumeClaimTemplates is %d", sts.Name, len(sts.Spec.VolumeClaimTemplates))
 
 	if sts.Annotations[AnnotationDrainerPodTemplate] == "" {
 		glog.Infof("Ignoring StatefulSet '%s' because it does not define a drain pod template.", sts.Name)
@@ -303,12 +311,6 @@ func (c *Controller) processStatefulSet(sts *appsv1.StatefulSet) error {
 	sort.Sort(sort.Reverse(sort.IntSlice(ordinals)))
 
 	for _, ordinal := range ordinals {
-
-        if (0 == *sts.Spec.Replicas) {
-			// Ensure data is not touched in the case of complete scaledown
-            glog.V(5).Infof("Replicas set to 0 for statefulset %s, ignoring.", sts.Name)
-			continue
-		}
 
         if (0 == ordinal) {
 			// This assumes order on scale up and down is enforced, i.e. the system waits for n, n-1,... 2, 1 to scaledown before attempting 0
@@ -352,6 +354,42 @@ func (c *Controller) processStatefulSet(sts *appsv1.StatefulSet) error {
 			if pod == nil { // TODO: what if the PVC doesn't exist here (or what if it's deleted just after we create the pod)
 				glog.Infof("Found orphaned PVC(s) for ordinal '%d'. Creating drain pod '%s'.", ordinal, podName)
 
+				// Check to ensure we have a pod to drain to
+				ordinalZeroPodName := getPodName(sts, 0)
+				ordinalZeroPod, err := c.podLister.Pods(sts.Namespace).Get(ordinalZeroPodName)
+				if err != nil {
+					glog.Errorf("Error while getting ordinal zero pod %s: %s", podName, err)
+					return err
+				}
+
+				// Ensure that at least the ordinal zero pod is running
+				if (corev1.PodRunning != ordinalZeroPod.Status.Phase) {
+					//glog.Infof("Ordinal zero pod '%s' status phase '%s', waiting for it to be Running.", sts.Name, pod.Status.Phase)
+					glog.Infof("Ordinal zero pod '%s' status phase not PodRunning, waiting for it to be Running.", sts.Name)
+					continue
+				}
+
+				// Ensure that at least the ordinal zero pod is Ready
+				podConditions := ordinalZeroPod.Status.Conditions
+
+				ordinalZeroPodReady := false
+				for _, podCondition := range podConditions {
+					glog.V(5).Infof("Ordinal zero pod condition %s", podCondition)
+					if (corev1.PodReady == podCondition.Type) {
+						if (corev1.ConditionTrue != podCondition.Status) {
+							glog.Infof("Ordinal zero pod '%s' podCondition Ready not True, waiting for it to True.", sts.Name)
+						}
+						if (corev1.ConditionTrue == podCondition.Status) {
+							glog.Infof("Ordinal zero pod '%s' podCondition Ready True, proceeding to create drainer pod.", sts.Name)
+							ordinalZeroPodReady = true
+						}
+					}
+				}
+
+				if (false == ordinalZeroPodReady) {
+					continue
+				}
+
 				pod, err := newPod(sts, ordinal)
 				if err != nil {
 					return fmt.Errorf("Can't create drain Pod object: %s", err)
@@ -387,10 +425,11 @@ func (c *Controller) getClaims(sts *appsv1.StatefulSet) (claimsGroupedByOrdinal 
 	if err != nil {
 		return nil, err
 	}
+	glog.V(5).Infof("getClaims allClaims len is %d", len(allClaims))
 
-	claims := map[int][]*corev1.PersistentVolumeClaim{}
-
+	claimsMap := map[int][]*corev1.PersistentVolumeClaim{}
 	for _, pvc := range allClaims {
+		glog.V(5).Infof("getClaims allClaims pvc name is '%s'", pvc.Name)
 		if pvc.DeletionTimestamp != nil {
 			glog.Infof("PVC '%s' is being deleted. Ignoring it.", pvc.Name)
 			continue
@@ -403,51 +442,60 @@ func (c *Controller) getClaims(sts *appsv1.StatefulSet) (claimsGroupedByOrdinal 
 
 		for _, t := range sts.Spec.VolumeClaimTemplates {
 			if name == fmt.Sprintf("%s-%s", t.Name, sts.Name) {
-				if claims[ordinal] == nil {
-					claims[ordinal] = []*corev1.PersistentVolumeClaim{}
+				if claimsMap[ordinal] == nil {
+					claimsMap[ordinal] = []*corev1.PersistentVolumeClaim{}
 				}
-				claims[ordinal] = append(claims[ordinal], pvc)
+				claimsMap[ordinal] = append(claimsMap[ordinal], pvc)
 			}
 		}
 	}
 
-	return claims, nil
+	return claimsMap, nil
 }
 
 func (c *Controller) cleanUpDrainPodIfNeeded(sts *appsv1.StatefulSet, pod *corev1.Pod, ordinal int) error {
 	// Drain Pod already exists. Check if it's done draining.
-	if pod.Status.Phase == corev1.PodSucceeded {
-		podName := getPodName(sts, ordinal)
+	podName := getPodName(sts, ordinal)
 
-		glog.Infof("Drain pod '%s' finished.", podName)
-		if (!c.localOnly) {
-			c.recorder.Event(sts, corev1.EventTypeNormal, DrainSuccess, fmt.Sprintf(MessageDrainPodFinished, podName, sts.Name))
-		}
+	switch (pod.Status.Phase) {
+		case (corev1.PodSucceeded):
+			glog.Infof("Drain pod '%s' finished.", podName)
+			if (!c.localOnly) {
+				c.recorder.Event(sts, corev1.EventTypeNormal, DrainSuccess, fmt.Sprintf(MessageDrainPodFinished, podName, sts.Name))
+			}
 
-		for _, pvcTemplate := range sts.Spec.VolumeClaimTemplates {
-			pvcName := getPVCName(sts, pvcTemplate.Name, int32(ordinal))
-			glog.Infof("Deleting PVC %s", pvcName)
-			err := c.kubeclientset.CoreV1().PersistentVolumeClaims(sts.Namespace).Delete(pvcName, nil)
+			for _, pvcTemplate := range sts.Spec.VolumeClaimTemplates {
+				pvcName := getPVCName(sts, pvcTemplate.Name, int32(ordinal))
+				glog.Infof("Deleting PVC %s", pvcName)
+				err := c.kubeclientset.CoreV1().PersistentVolumeClaims(sts.Namespace).Delete(pvcName, nil)
+				if err != nil {
+					return err
+				}
+				if (!c.localOnly) {
+					c.recorder.Event(sts, corev1.EventTypeNormal, PVCDeleteSuccess, fmt.Sprintf(MessagePVCDeleted, pvcName, sts.Name))
+				}
+			}
+
+			// TODO what if the user scales up the statefulset and the statefulset controller creates the new pod after we delete the pod but before we delete the PVC
+			// TODO what if we crash after we delete the PVC, but before we delete the pod?
+
+			glog.Infof("Deleting drain pod %s", podName)
+			err := c.kubeclientset.CoreV1().Pods(sts.Namespace).Delete(podName, nil)
 			if err != nil {
 				return err
 			}
 			if (!c.localOnly) {
-				c.recorder.Event(sts, corev1.EventTypeNormal, PVCDeleteSuccess, fmt.Sprintf(MessagePVCDeleted, pvcName, sts.Name))
+				c.recorder.Event(sts, corev1.EventTypeNormal, PodDeleteSuccess, fmt.Sprintf(MessageDrainPodDeleted, podName, sts.Name))
 			}
-		}
-
-		// TODO what if the user scales up the statefulset and the statefulset controller creates the new pod after we delete the pod but before we delete the PVC
-		// TODO what if we crash after we delete the PVC, but before we delete the pod?
-
-		glog.Infof("Deleting drain pod %s", podName)
-		err := c.kubeclientset.CoreV1().Pods(sts.Namespace).Delete(podName, nil)
-		if err != nil {
-			return err
-		}
-		if (!c.localOnly) {
-			c.recorder.Event(sts, corev1.EventTypeNormal, PodDeleteSuccess, fmt.Sprintf(MessageDrainPodDeleted, podName, sts.Name))
-		}
+			break
+		case (corev1.PodFailed):
+			glog.Infof("Drain pod '%s' failed.", podName)
+			break
+		default:
+			glog.Infof("Drain pod Phase was %s", pod.Status.Phase)
+			break
 	}
+
 	return nil
 }
 
@@ -505,6 +553,11 @@ func (c *Controller) handlePod(obj interface{}) {
 			return
 		}
 
+		if (0 == *sts.Spec.Replicas) {
+			glog.V(5).Infof("NameFromAnnotation not enqueueing Statefulset '%s' as Spec.Replicas is 0.", sts.Name)
+			return
+		}
+
 		c.enqueueStatefulSet(sts)
 		return
 	}
@@ -519,6 +572,11 @@ func (c *Controller) handlePod(obj interface{}) {
 		sts, err := c.statefulSetLister.StatefulSets(object.GetNamespace()).Get(ownerRef.Name)
 		if err != nil {
 			glog.V(4).Infof("ignoring orphaned object '%s' of StatefulSet '%s'", object.GetSelfLink(), ownerRef.Name)
+			return
+		}
+
+		if (0 == *sts.Spec.Replicas) {
+			glog.V(5).Infof("Name from ownerRef.Name not enqueueing Statefulset '%s' as Spec.Replicas is 0.", sts.Name)
 			return
 		}
 
