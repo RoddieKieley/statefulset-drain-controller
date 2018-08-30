@@ -1,0 +1,34 @@
+schema_version: 1
+
+name: "amq-broker-7/amq-broker-7-scaledown-controller"
+description: "Red Hat AMQ Broker 7.2 Scaledown Controller"
+version: "0.4"
+from: "rhel7:7.5-424"
+labels:
+    - name: "com.redhat.component"
+      value: "amq-7-broker-72-scaledown-controller-container"
+    - name: "io.k8s.description"
+      value: "An associated controller that handles message migration between brokers on scaledown."
+    - name: "io.k8s.display-name"
+      value: "Red Hat AMQ Broker 7.2 Scaledown Controller"
+    - name: "maintainer"
+      value: "rkieley@redhat.com"
+    - name: "io.openshift.tags"
+      value: "messaging,amq,java,jboss,xpaas"
+    - name: "io.openshift.s2i.scripts-url"
+      value: "image:///usr/local/s2i"
+artifacts:
+    - name: controller
+      path: controller
+      md5: 783d193659c3c26dbf77e046c1cca004
+      description: "Locally built golang statefulset-drain-controller executable."
+run:
+      user: 185
+      cmd:
+          - "/controller"
+          - "--alsologtostderr"
+osbs:
+      repository:
+            name: containers/amq-7-broker-scaledown-controller
+            branch: rh-amq-broker-7.2-scaledown-controller-openshift-dev-rhel-7
+
