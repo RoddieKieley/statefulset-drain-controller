@@ -24,7 +24,7 @@ import (
 	kubeinformers "k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/clientcmd"
-	"github.com/luksa/statefulset-drain-controller/pkg/signals"
+	"github.com/roddiekieley/statefulset-drain-controller/pkg/signals"
 	"github.com/roddiekieley/statefulset-drain-controller/pkg/controller"
 	"io/ioutil"
 )
